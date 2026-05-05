@@ -8,7 +8,7 @@ Unified Guardrail, leveraging LiteLLM's /applyGuardrail endpoint
 
 import copy
 import json
-from typing import Any, AsyncGenerator, List, Optional, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 from fastapi import HTTPException
 
@@ -27,6 +27,32 @@ from litellm.types.utils import CallTypes, CallTypesLiteral
 A2A_CALL_TYPES = (CallTypes.asend_message, CallTypes.send_message)
 
 GUARDRAIL_NAME = "unified_llm_guardrails"
+
+# Iterator-hook mode constants for streaming guardrails.
+#
+# `moderation` (default) preserves the historical behavior: the guardrail
+# is sampled on accumulated text for compliance scanning / BLOCKED
+# decisions, and the original upstream chunks are forwarded to the client
+# verbatim. Anything the guardrail returns in `texts` is observed but
+# not applied to the outbound stream.
+#
+# `transform` flips the yield strategy: the guardrail's modified texts
+# are yielded to the client instead of the original upstream chunks. At
+# each sample point the chunk content emitted is the new prefix of the
+# guardrail's modified accumulated output (i.e. the part that hasn't
+# been yielded yet); chunks between samples are buffered and drained at
+# the next sample or at end-of-stream. Required for guardrails that
+# need to rewrite (mask, redact, deanonymize, …) streamed content
+# before it reaches the client.
+#
+# Opt-in per guardrail. Default is `moderation` so existing
+# moderation-only consumers are unaffected.
+ITERATOR_HOOK_MODE_MODERATION = "moderation"
+ITERATOR_HOOK_MODE_TRANSFORM = "transform"
+_VALID_ITERATOR_HOOK_MODES = (
+    ITERATOR_HOOK_MODE_MODERATION,
+    ITERATOR_HOOK_MODE_TRANSFORM,
+)
 
 
 def _get_a2a_request_id(
@@ -50,6 +76,208 @@ def _get_a2a_request_id(
 
 
 endpoint_guardrail_translation_mappings = None
+
+
+# ── Transform-mode helpers ────────────────────────────────────────────
+
+
+def _resolve_iterator_hook_mode(
+    guardrail_to_apply: Any,
+    optional_params: dict,
+) -> str:
+    """Resolve the iterator-hook mode for a streaming post_call.
+
+    Mirrors the resolution chain `_resolve_streaming_*` uses for
+    `streaming_sampling_rate` / `streaming_end_of_stream_only`:
+
+      1. Direct attribute on the guardrail instance.
+      2. `guardrail_config` dict on the guardrail instance.
+      3. The hook's own `optional_params` (kwargs passed to
+         `UnifiedLLMGuardrails.__init__`).
+
+    Falls back to the moderation default when nothing matches. Unknown
+    string values are coerced to the default with a warning so a
+    config typo can't silently turn off transform mode for a guardrail
+    the operator intended to enable it on.
+    """
+    mode: str = ITERATOR_HOOK_MODE_MODERATION
+
+    if guardrail_to_apply is not None:
+        mode = getattr(guardrail_to_apply, "iterator_hook_mode", mode)
+        guardrail_config = getattr(guardrail_to_apply, "guardrail_config", {})
+        if isinstance(guardrail_config, dict):
+            mode = guardrail_config.get("iterator_hook_mode", mode)
+
+    mode = optional_params.get("iterator_hook_mode", mode)
+
+    if not isinstance(mode, str) or mode not in _VALID_ITERATOR_HOOK_MODES:
+        verbose_proxy_logger.warning(
+            "UnifiedLLMGuardrails: ignoring unknown iterator_hook_mode=%r "
+            "(allowed: %s); falling back to %r.",
+            mode,
+            ", ".join(_VALID_ITERATOR_HOOK_MODES),
+            ITERATOR_HOOK_MODE_MODERATION,
+        )
+        mode = ITERATOR_HOOK_MODE_MODERATION
+
+    return mode
+
+
+# Per-(choice, content) cursor of how many characters of the current
+# guardrail-modified accumulated text have been emitted to the client.
+# `content_idx` is `None` for the standard string-content case; for
+# OpenAI multimodal list content it's the index of the text part. Reset
+# at the start of each streaming hook invocation; not persisted across
+# calls.
+_TransformCursor = Dict[Tuple[int, Optional[int]], int]
+
+
+def _iter_modified_chunk_content(
+    responses_so_far: List[Any],
+) -> List[Tuple[int, Optional[int], str]]:
+    """Read the modified accumulated content from `responses_so_far`.
+
+    `_apply_guardrail_responses_to_output_streaming` (and equivalents
+    on other endpoint translations) puts the full guardrail-modified
+    accumulated text in the FIRST chunk per choice and clears subsequent
+    chunks to "". This helper extracts the modified text from chunk 0
+    so transform-mode can compute the delta to yield.
+
+    Returns a list of `(choice_idx, content_idx, modified_text)`
+    tuples. `content_idx` is `None` for plain-string `delta.content` /
+    `message.content`; an int for the multimodal list-content case.
+    Choices that don't carry text (tool calls only, etc.) are skipped.
+
+    Returns an empty list when `responses_so_far` has no chunks or the
+    first chunk has no choices — the caller treats that as "nothing to
+    yield this sample."
+    """
+    out: List[Tuple[int, Optional[int], str]] = []
+    if not responses_so_far:
+        return out
+    first = responses_so_far[0]
+    choices = getattr(first, "choices", None)
+    if not choices:
+        return out
+    for choice_idx, choice in enumerate(choices):
+        # Streaming chunks have `delta`; non-streaming have `message`.
+        # We're called from the streaming path so prefer `delta` and
+        # only fall back for safety.
+        delta = getattr(choice, "delta", None)
+        content = getattr(delta, "content", None) if delta is not None else None
+        if content is None:
+            message = getattr(choice, "message", None)
+            content = getattr(message, "content", None) if message is not None else None
+
+        if isinstance(content, str):
+            out.append((choice_idx, None, content))
+        elif isinstance(content, list):
+            for content_idx, content_item in enumerate(content):
+                if isinstance(content_item, dict) and isinstance(
+                    content_item.get("text"), str
+                ):
+                    out.append((choice_idx, content_idx, content_item["text"]))
+    return out
+
+
+def _build_transform_chunk(
+    template: Any,
+    choice_idx: int,
+    content_idx: Optional[int],
+    delta_text: str,
+) -> Any:
+    """Build a streaming chunk carrying just the delta we want to emit.
+
+    `template` is an upstream chunk we deep-copy to inherit metadata
+    (`id`, `model`, `created`, etc.). We then overwrite the chosen
+    choice's content with `delta_text` and clear/replace any other
+    text-bearing fields so the client only sees what we mean to send.
+
+    Note this intentionally yields a single chunk per call; the caller
+    yields one chunk per `(choice_idx, content_idx)` for which the
+    delta is non-empty.
+    """
+    chunk = copy.deepcopy(template)
+    choices = getattr(chunk, "choices", None) or []
+
+    for emit_idx, choice in enumerate(choices):
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            continue
+        if emit_idx != choice_idx:
+            # Suppress unrelated choices on this delta-only chunk.
+            if hasattr(delta, "content"):
+                delta.content = None
+            continue
+
+        if content_idx is None:
+            delta.content = delta_text
+        else:
+            existing = getattr(delta, "content", None)
+            if isinstance(existing, list) and 0 <= content_idx < len(existing):
+                # Multimodal: replace just the targeted text part; clear
+                # any other text parts on the same choice.
+                for item_idx, content_item in enumerate(existing):
+                    if not isinstance(content_item, dict):
+                        continue
+                    if "text" not in content_item:
+                        continue
+                    content_item["text"] = delta_text if item_idx == content_idx else ""
+            else:
+                # Couldn't find the targeted slot — fall back to
+                # plain-string assignment so we still emit something
+                # rather than dropping the delta silently.
+                delta.content = delta_text
+
+    return chunk
+
+
+def _emit_transform_deltas(
+    responses_so_far: List[Any],
+    template: Any,
+    cursor: _TransformCursor,
+) -> List[Any]:
+    """Compute and return the chunks to yield this sample for transform
+    mode.
+
+    Reads modified accumulated text from `responses_so_far[0]`, diffs
+    against `cursor[(choice_idx, content_idx)]`, and emits one
+    delta-only chunk per (choice, content) that has new content. Mutates
+    `cursor` in place to advance the per-choice yielded-character count.
+
+    Fail-open behavior:
+      * If the modified text is shorter than what's already been yielded
+        (a guardrail removed earlier characters) we can't un-yield, so
+        we skip emission for that (choice, content) without advancing
+        the cursor. The next sample's modified text will be diffed
+        against the same cursor — if it grows back past the old
+        position, the new tail is emitted.
+      * Empty deltas are not yielded.
+    """
+    chunks: List[Any] = []
+    for choice_idx, content_idx, modified in _iter_modified_chunk_content(
+        responses_so_far
+    ):
+        key = (choice_idx, content_idx)
+        already = cursor.get(key, 0)
+        if len(modified) < already:
+            # Fail-open: shrink-modified content has no clean delta.
+            verbose_proxy_logger.debug(
+                "UnifiedLLMGuardrails transform mode: modified content "
+                "shorter than already-yielded prefix for "
+                "(choice=%s, content=%s); skipping emission this sample.",
+                choice_idx,
+                content_idx,
+            )
+            continue
+        new_delta = modified[already:]
+        if not new_delta:
+            continue
+        chunks.append(
+            _build_transform_chunk(template, choice_idx, content_idx, new_delta)
+        )
+        cursor[key] = len(modified)
+    return chunks
 
 
 def _ensure_litellm_metadata(data: dict, user_api_key_dict: UserAPIKeyAuth) -> None:
@@ -340,6 +568,17 @@ class UnifiedLLMGuardrails(CustomLogger):
             "streaming_end_of_stream_only", end_of_stream_only
         )
 
+        # Iterator-hook mode resolution. `transform` opts a guardrail
+        # into yielding modified texts to the client (rather than the
+        # historical moderation-only behavior of yielding originals).
+        # See `_resolve_iterator_hook_mode` for the lookup chain.
+        iterator_hook_mode = _resolve_iterator_hook_mode(
+            guardrail_to_apply, self.optional_params
+        )
+        # Per-(choice, content_idx) yielded-character cursor used in
+        # transform mode. See `_emit_transform_deltas`.
+        transform_cursor: _TransformCursor = {}
+
         if guardrail_to_apply is None:
             async for item in response:
                 yield item
@@ -394,9 +633,13 @@ class UnifiedLLMGuardrails(CustomLogger):
                     yield remaining_item
                 return
 
-            # If end_of_stream_only mode, yield chunks without processing
+            # If end_of_stream_only mode, yield chunks without processing.
+            # In transform mode, end_of_stream_only buffers everything
+            # until the post-loop final-flush block below — yielding
+            # originals here would defeat the purpose.
             if end_of_stream_only:
-                yield item
+                if iterator_hook_mode == ITERATOR_HOOK_MODE_MODERATION:
+                    yield item
                 continue
 
             # Process chunk based on sampling rate
@@ -462,9 +705,29 @@ class UnifiedLLMGuardrails(CustomLogger):
                         yield error_chunk
                         return
                     raise
-                yield original_item
+
+                if iterator_hook_mode == ITERATOR_HOOK_MODE_TRANSFORM:
+                    # Yield the new tail of the guardrail-modified
+                    # accumulated text (per choice / content index)
+                    # rather than the original chunk. Buffered chunks
+                    # since the last sample are drained here too — the
+                    # cursor advances by exactly the number of new
+                    # characters, regardless of how many upstream
+                    # chunks contributed them.
+                    for delta_chunk in _emit_transform_deltas(
+                        responses_so_far, original_item, transform_cursor
+                    ):
+                        yield delta_chunk
+                else:
+                    yield original_item
             else:
-                yield item
+                # Between samples: moderation mode forwards the
+                # original chunk immediately; transform mode buffers
+                # (the chunk was already appended to `responses_so_far`
+                # above and will be drained at the next sample point or
+                # at end-of-stream).
+                if iterator_hook_mode == ITERATOR_HOOK_MODE_MODERATION:
+                    yield item
 
         # Stream has ended - do final processing with all collected chunks
         if (
@@ -518,5 +781,34 @@ class UnifiedLLMGuardrails(CustomLogger):
                         + "\n"
                     )
                     yield error_chunk
+                    return
                 else:
                     raise
+
+            if iterator_hook_mode == ITERATOR_HOOK_MODE_TRANSFORM and responses_so_far:
+                # Final transform-mode flush. Drain any remaining new
+                # tail of the guardrail-modified accumulated text, then
+                # forward a content-cleared copy of the last upstream
+                # chunk so `finish_reason` / `usage` / other terminal
+                # metadata reaches the client. The terminal chunk is
+                # always emitted, even if no fresh delta content was
+                # produced this sample (otherwise SSE clients would
+                # never see the stream terminate cleanly under transform
+                # mode for guardrails that don't add content).
+                template = responses_so_far[-1]
+                for delta_chunk in _emit_transform_deltas(
+                    responses_so_far, template, transform_cursor
+                ):
+                    yield delta_chunk
+
+                terminal = copy.deepcopy(template)
+                for choice in getattr(terminal, "choices", None) or []:
+                    delta = getattr(choice, "delta", None)
+                    if delta is None:
+                        continue
+                    # Wipe content but preserve finish_reason / usage /
+                    # role / tool_calls / anything else attached to the
+                    # last upstream chunk.
+                    if hasattr(delta, "content"):
+                        delta.content = None
+                yield terminal

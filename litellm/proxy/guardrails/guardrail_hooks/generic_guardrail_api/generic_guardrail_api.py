@@ -188,6 +188,7 @@ class GenericGuardrailAPI(CustomGuardrail):
         additional_provider_specific_params: Optional[Dict[str, Any]] = None,
         unreachable_fallback: Literal["fail_closed", "fail_open"] = "fail_closed",
         extra_headers: Optional[list] = None,
+        iterator_hook_mode: Optional[str] = None,
         **kwargs,
     ):
         self.async_handler = get_async_httpx_client(
@@ -222,6 +223,15 @@ class GenericGuardrailAPI(CustomGuardrail):
         self.unreachable_fallback: Literal["fail_closed", "fail_open"] = (
             unreachable_fallback
         )
+
+        # Iterator-hook mode for streaming post_call. Read by
+        # `UnifiedLLMGuardrails.async_post_call_streaming_iterator_hook`
+        # to decide whether to forward original upstream chunks
+        # (`moderation`, default) or yield the guardrail-modified
+        # accumulated text as deltas (`transform`). See the unified
+        # guardrail module for the full semantics.
+        if iterator_hook_mode is not None:
+            self.iterator_hook_mode = iterator_hook_mode
 
         # Set supported event hooks
         if "supported_event_hooks" not in kwargs:

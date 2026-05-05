@@ -351,6 +351,307 @@ class TestUnifiedLLMGuardrails:
                     f"Expected non-empty content for every streamed chunk."
                 )
 
+    class TestIteratorHookTransformMode:
+        """Tests for `iterator_hook_mode` opt-in transform support.
+
+        In transform mode, the guardrail's modified accumulated text is
+        yielded to the client as deltas instead of the original
+        upstream chunks being forwarded verbatim. Required for
+        guardrails that need to rewrite (mask / redact / deanonymize)
+        streamed content before it reaches the client.
+
+        See `unified_guardrail._resolve_iterator_hook_mode` and
+        `_emit_transform_deltas`.
+        """
+
+        @staticmethod
+        def _make_chunks(words):
+            """Build a sequence of streaming chunks, one chunk per
+            word, with a final empty-content `finish_reason='stop'`
+            chunk to mirror the OpenAI streaming shape."""
+            chunks = [
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(content=w, role="assistant"),
+                            finish_reason=None,
+                        )
+                    ],
+                )
+                for w in words
+            ]
+            chunks.append(
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(content="", role="assistant"),
+                            finish_reason="stop",
+                        )
+                    ],
+                )
+            )
+            return chunks
+
+        @staticmethod
+        def _install_uppercasing_translation():
+            """Install a translation that combines streamed text and
+            upper-cases the result before writing it back to chunk 0
+            and clearing subsequent chunks. Models the shape every
+            real `process_output_streaming_response` produces (combine
+            → modify → place modified in [0] → clear rest)."""
+
+            class _UppercasingTranslation(BaseTranslation):
+                async def process_input_messages(  # type: ignore[override]
+                    self, data, guardrail_to_apply, litellm_logging_obj=None
+                ):
+                    return data
+
+                async def process_output_response(  # type: ignore[override]
+                    self,
+                    response,
+                    guardrail_to_apply,
+                    litellm_logging_obj=None,
+                    user_api_key_dict=None,
+                ):
+                    return response
+
+                async def process_output_streaming_response(  # type: ignore[override]
+                    self,
+                    responses_so_far,
+                    guardrail_to_apply,
+                    litellm_logging_obj=None,
+                    user_api_key_dict=None,
+                    request_data=None,
+                ):
+                    combined = ""
+                    for resp in responses_so_far:
+                        for choice in resp.choices:
+                            if choice.delta and choice.delta.content:
+                                combined += choice.delta.content
+                    modified = combined.upper()
+
+                    first_set = False
+                    for resp in responses_so_far:
+                        for choice in resp.choices:
+                            if not first_set:
+                                choice.delta.content = modified
+                                first_set = True
+                            else:
+                                choice.delta.content = ""
+                    return responses_so_far
+
+            unified_module.endpoint_guardrail_translation_mappings = {
+                CallTypes.acompletion: _UppercasingTranslation,
+            }
+
+        @pytest.mark.asyncio
+        async def test_moderation_mode_default_yields_original_chunks(self):
+            """Regression pin: default mode (`moderation`) forwards
+            the original upstream chunks verbatim, even though
+            `process_output_streaming_response` rewrote the accumulated
+            content. Existing consumers must keep seeing this behavior."""
+            self._install_uppercasing_translation()
+
+            handler = UnifiedLLMGuardrails()
+            guardrail = RecordingGuardrail()
+
+            chunks = self._make_chunks(["hello ", "world"])
+
+            async def stream():
+                for c in chunks:
+                    yield c
+
+            yielded_contents = []
+            async for item in handler.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=UserAPIKeyAuth(
+                    api_key="test-key",
+                    request_route="/v1/chat/completions",
+                ),
+                response=stream(),
+                request_data={"guardrail_to_apply": guardrail, "model": "gpt-4"},
+            ):
+                content = (
+                    item.choices[0].delta.content if item.choices[0].delta else None
+                )
+                yielded_contents.append(content)
+
+            # Joined output should be the ORIGINAL lowercase form,
+            # not the uppercase-modified version.
+            assert "".join(c or "" for c in yielded_contents) == "hello world"
+
+        @pytest.mark.asyncio
+        async def test_transform_mode_yields_modified_deltas(self):
+            """Transform mode yields the guardrail-modified accumulated
+            text as deltas instead of forwarding originals. The final
+            client-visible content must be the MODIFIED form."""
+            self._install_uppercasing_translation()
+
+            handler = UnifiedLLMGuardrails(iterator_hook_mode="transform")
+            guardrail = RecordingGuardrail()
+
+            chunks = self._make_chunks(["hello ", "world"])
+
+            async def stream():
+                for c in chunks:
+                    yield c
+
+            yielded_contents = []
+            async for item in handler.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=UserAPIKeyAuth(
+                    api_key="test-key",
+                    request_route="/v1/chat/completions",
+                ),
+                response=stream(),
+                request_data={"guardrail_to_apply": guardrail, "model": "gpt-4"},
+            ):
+                content = (
+                    item.choices[0].delta.content if item.choices[0].delta else None
+                )
+                yielded_contents.append(content)
+
+            # Joined client-visible output must be the modified form.
+            assembled = "".join(c or "" for c in yielded_contents)
+            assert assembled == "HELLO WORLD"
+
+        @pytest.mark.asyncio
+        async def test_transform_mode_buffers_between_samples(self):
+            """Between sample points, transform mode does NOT forward
+            upstream chunks. The deltas the client receives only
+            arrive at sample boundaries and the end-of-stream flush —
+            never inter-sample originals (which would carry pre-
+            transform content)."""
+            self._install_uppercasing_translation()
+
+            # sampling_rate=3 with 5 chunks (4 content + 1 finish)
+            # → one sample at chunk 3, then end-of-stream flush.
+            handler = UnifiedLLMGuardrails(
+                iterator_hook_mode="transform",
+                streaming_sampling_rate=3,
+            )
+            guardrail = RecordingGuardrail()
+
+            chunks = self._make_chunks(["a", "b", "c", "d"])
+
+            async def stream():
+                for c in chunks:
+                    yield c
+
+            yielded = []
+            async for item in handler.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=UserAPIKeyAuth(
+                    api_key="test-key",
+                    request_route="/v1/chat/completions",
+                ),
+                response=stream(),
+                request_data={"guardrail_to_apply": guardrail, "model": "gpt-4"},
+            ):
+                yielded.append(item)
+
+            # Transform mode should yield strictly fewer chunks than
+            # the upstream input (5) — no per-chunk pass-through.
+            assert len(yielded) < len(chunks)
+            # And the assembled client-visible text is the modified form.
+            assembled = "".join(
+                (
+                    item.choices[0].delta.content
+                    if item.choices and item.choices[0].delta
+                    else ""
+                )
+                or ""
+                for item in yielded
+            )
+            assert assembled == "ABCD"
+
+        @pytest.mark.asyncio
+        async def test_transform_mode_emits_terminal_chunk_with_finish_reason(self):
+            """The final upstream chunk's `finish_reason` (and other
+            terminal metadata) must propagate to the client even when
+            no fresh delta content is emitted at end-of-stream."""
+            self._install_uppercasing_translation()
+
+            handler = UnifiedLLMGuardrails(iterator_hook_mode="transform")
+            guardrail = RecordingGuardrail()
+
+            chunks = self._make_chunks(["hi"])
+
+            async def stream():
+                for c in chunks:
+                    yield c
+
+            yielded = []
+            async for item in handler.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=UserAPIKeyAuth(
+                    api_key="test-key",
+                    request_route="/v1/chat/completions",
+                ),
+                response=stream(),
+                request_data={"guardrail_to_apply": guardrail, "model": "gpt-4"},
+            ):
+                yielded.append(item)
+
+            finish_reasons = [
+                item.choices[0].finish_reason
+                for item in yielded
+                if item.choices and item.choices[0].finish_reason is not None
+            ]
+            assert "stop" in finish_reasons, (
+                f"Transform mode must propagate finish_reason='stop' "
+                f"to the client; saw chunks {yielded!r}"
+            )
+
+        def test_resolve_iterator_hook_mode_lookup_chain(self):
+            """Resolution priority for `iterator_hook_mode`:
+            optional_params (most-specific) > guardrail_config dict >
+            direct attribute on the guardrail > default."""
+
+            class _GuardrailWithAttr:
+                iterator_hook_mode = "transform"
+                guardrail_config = {}
+
+            # Direct attribute wins over the default.
+            assert (
+                unified_module._resolve_iterator_hook_mode(_GuardrailWithAttr(), {})
+                == "transform"
+            )
+
+            # guardrail_config overrides direct attribute.
+            class _GuardrailWithConfig:
+                iterator_hook_mode = "transform"
+                guardrail_config = {"iterator_hook_mode": "moderation"}
+
+            assert (
+                unified_module._resolve_iterator_hook_mode(_GuardrailWithConfig(), {})
+                == "moderation"
+            )
+
+            # optional_params overrides everything.
+            assert (
+                unified_module._resolve_iterator_hook_mode(
+                    _GuardrailWithAttr(),
+                    {"iterator_hook_mode": "moderation"},
+                )
+                == "moderation"
+            )
+
+            # Unknown value → falls back to moderation default.
+            class _GuardrailBogus:
+                iterator_hook_mode = "completely_invalid"
+                guardrail_config = {}
+
+            assert (
+                unified_module._resolve_iterator_hook_mode(_GuardrailBogus(), {})
+                == "moderation"
+            )
+
+            # Nothing set anywhere → moderation default.
+            class _GuardrailEmpty:
+                guardrail_config = {}
+
+            assert (
+                unified_module._resolve_iterator_hook_mode(_GuardrailEmpty(), {})
+                == "moderation"
+            )
+
     class TestOCRGuardrailE2E:
         """End-to-end tests: UnifiedLLMGuardrails -> OCRHandler."""
 
